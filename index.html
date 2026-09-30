@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Quiz Scanner</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --fg:#e9ecf1; --muted:#8a93a3; --accent:#3ddc84; --err:#ff5c5c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  main { max-width:520px; margin:0 auto; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  .card { background:var(--card); border-radius:14px; padding:14px; }
+  label { font-size:13px; color:var(--muted); display:block; margin-bottom:4px; }
+  input { width:100%; padding:10px; border-radius:8px; border:1px solid #333a46; background:#11141a; color:var(--fg); font-size:15px; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  button { padding:14px; border:0; border-radius:10px; font-size:17px; font-weight:600; background:var(--accent); color:#06210f; }
+  button.stop { background:var(--err); color:#fff; }
+  video { width:100%; border-radius:10px; background:#000; aspect-ratio:4/3; object-fit:cover; }
+  #answer { font-size:96px; font-weight:800; text-align:center; line-height:1; color:var(--accent); min-height:96px; }
+  #answerText { text-align:center; font-size:18px; margin-top:8px; }
+  #question { font-size:13px; color:var(--muted); margin-top:10px; }
+  #status { font-size:13px; color:var(--muted); text-align:center; }
+  #status.err { color:var(--err); }
+  details summary { cursor:pointer; color:var(--muted); font-size:14px; }
+  details[open] summary { margin-bottom:10px; }
+  .field { margin-bottom:10px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <div id="answer">–</div>
+    <div id="answerText">Druk op Start</div>
+    <div id="question"></div>
+  </div>
+
+  <div id="status">Klaar</div>
+
+  <button id="toggle">Start</button>
+
+  <video id="video" playsinline muted></video>
+
+  <details class="card" id="settings">
+    <summary>Instellingen</summary>
+    <div class="field">
+      <label for="apiKey">OpenAI API key</label>
+      <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off">
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="model">Model</label>
+        <input id="model" value="gpt-4o">
+      </div>
+      <div class="field">
+        <label for="interval">Interval (sec)</label>
+        <input id="interval" type="number" min="1" value="5">
+      </div>
+    </div>
+  </details>
+
+  <canvas id="canvas" hidden></canvas>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('canvas');
+let running = false, stream = null, timer = null, wakeLock = null, lastQuestion = '';
+
+// Instellingen onthouden op dit toestel
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} }
+};
+for (const k of ['apiKey', 'model', 'interval']) {
+  const v = store.get('qs_' + k);
+  if (v) $(k).value = v;
+  $(k).addEventListener('change', () => store.set('qs_' + k, $(k).value.trim()));
+}
+if (!$('apiKey').value) $('settings').open = true;
+
+function setStatus(msg, isErr = false) {
+  $('status').textContent = msg;
+  $('status').className = isErr ? 'err' : '';
+}
+
+async function startCamera() {
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+function stopCamera() {
+  stream?.getTracks().forEach(t => t.stop());
+  stream = null;
+  video.srcObject = null;
+}
+
+function captureFrame() {
+  const maxSide = 1280;
+  const scale = Math.min(1, maxSide / Math.max(video.videoWidth, video.videoHeight));
+  canvas.width = Math.round(video.videoWidth * scale);
+  canvas.height = Math.round(video.videoHeight * scale);
+  canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/jpeg', 0.8);
+}
+
+async function askOpenAI(dataUrl) {
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + $('apiKey').value.trim()
+    },
+    body: JSON.stringify({
+      model: $('model').value.trim() || 'gpt-4o',
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: 'Je krijgt een foto (met een gsm genomen) van een computerscherm met een meerkeuzevraag. ' +
+                   'Lees de vraag en de antwoordopties en bepaal het juiste antwoord. ' +
+                   'Antwoord ENKEL met JSON: {"question": "korte samenvatting van de vraag", ' +
+                   '"answer": "letter of nummer van de optie (bv. B)", "answer_text": "tekst van het juiste antwoord", ' +
+                   '"confidence": "hoog|middel|laag"}. ' +
+                   'Als er geen meerkeuzevraag leesbaar is: {"answer": "", "answer_text": "Geen vraag gevonden"}.'
+        },
+        {
+          role: 'user',
+          content: [{ type: 'image_url', image_url: { url: dataUrl, detail: 'high' } }]
+        }
+      ]
+    })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error?.message || 'HTTP ' + res.status);
+  }
+  const data = await res.json();
+  return JSON.parse(data.choices[0].message.content);
+}
+
+async function tick() {
+  if (!running) return;
+  try {
+    setStatus('Foto nemen en versturen…');
+    const t0 = performance.now();
+    const result = await askOpenAI(captureFrame());
+    if (!running) return;
+
+    if (result.answer) {
+      const isNew = result.question && result.question !== lastQuestion;
+      $('answer').textContent = result.answer;
+      $('answerText').textContent = result.answer_text || '';
+      $('question').textContent = (result.question || '') + (result.confidence ? `  ·  zekerheid: ${result.confidence}` : '');
+      if (isNew && navigator.vibrate) navigator.vibrate(150);
+      lastQuestion = result.question || lastQuestion;
+    } else {
+      $('answerText').textContent = result.answer_text || 'Geen vraag gevonden';
+    }
+    setStatus(`OK (${((performance.now() - t0) / 1000).toFixed(1)}s) · volgende foto binnen ${$('interval').value}s`);
+  } catch (e) {
+    setStatus('Fout: ' + e.message, true);
+  }
+  // Pas na het antwoord de volgende foto plannen, zodat requests nooit overlappen
+  if (running) timer = setTimeout(tick, Math.max(1, Number($('interval').value) || 5) * 1000);
+}
+
+async function start() {
+  if (!$('apiKey').value.trim()) {
+    $('settings').open = true;
+    setStatus('Vul eerst je OpenAI API key in', true);
+    return;
+  }
+  try {
+    await startCamera();
+  } catch (e) {
+    setStatus('Camera niet beschikbaar: ' + e.message + ' (pagina moet via https geopend worden)', true);
+    return;
+  }
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  running = true;
+  $('toggle').textContent = 'Stop';
+  $('toggle').classList.add('stop');
+  $('settings').open = false;
+  tick();
+}
+
+function stop() {
+  running = false;
+  clearTimeout(timer);
+  stopCamera();
+  wakeLock?.release().catch(() => {});
+  wakeLock = null;
+  $('toggle').textContent = 'Start';
+  $('toggle').classList.remove('stop');
+  setStatus('Gestopt');
+}
+
+$('toggle').addEventListener('click', () => running ? stop() : start());
+
+// Scherm-lock gaat verloren als de tab even op de achtergrond was
+document.addEventListener('visibilitychange', async () => {
+  if (running && document.visibilityState === 'visible') {
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  }
+});
+</script>
+</body>
+</html>
